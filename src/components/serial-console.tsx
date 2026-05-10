@@ -12,7 +12,10 @@ import {
 import {
   AlertCircle,
   Cable,
+  Circle,
+  CircleStop,
   Database,
+  FileText,
   PlugZap,
   Power,
   RadioTower,
@@ -25,6 +28,10 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { VehicleFuelLevel } from "@/components/vehicle-fuel-level"
+import { VehicleLocationMap } from "@/components/vehicle-location-map"
+import { VehicleSpeedGauge } from "@/components/vehicle-speed-gauge"
+import { VehicleStatusCard } from "@/components/vehicle-status-card"
 import {
   boardStatusFlags,
   parseTelemetryFrames,
@@ -80,6 +87,35 @@ type SerialLike = {
 
 type NavigatorWithSerial = Navigator & {
   serial?: SerialLike
+}
+
+type FilePickerAcceptTypeLike = {
+  description?: string
+  accept: Record<string, string[]>
+}
+
+type SaveFilePickerOptionsLike = {
+  suggestedName?: string
+  types?: FilePickerAcceptTypeLike[]
+  excludeAcceptAllOption?: boolean
+}
+
+type FileSystemWritableFileStreamLike = {
+  write(data: string): Promise<void>
+  close(): Promise<void>
+}
+
+type FileSystemFileHandleLike = {
+  createWritable(options?: {
+    keepExistingData?: boolean
+    mode?: "exclusive" | "siloed"
+  }): Promise<FileSystemWritableFileStreamLike>
+}
+
+type WindowWithFileSystemAccess = Window & {
+  showSaveFilePicker?: (
+    options?: SaveFilePickerOptionsLike,
+  ) => Promise<FileSystemFileHandleLike>
 }
 
 type AuthorizedPort = {
@@ -140,6 +176,16 @@ function getSerialApi(): SerialLike | null {
   return (navigator as NavigatorWithSerial).serial ?? null
 }
 
+function getSaveFilePicker():
+  | WindowWithFileSystemAccess["showSaveFilePicker"]
+  | null {
+  if (typeof window === "undefined") {
+    return null
+  }
+
+  return (window as WindowWithFileSystemAccess).showSaveFilePicker ?? null
+}
+
 function subscribeSerialSupport(onStoreChange: () => void): () => void {
   const serial = getSerialApi()
 
@@ -164,6 +210,18 @@ function getServerSerialSupportSnapshot(): boolean {
   return false
 }
 
+function subscribeFileRecordingSupport(): () => void {
+  return () => {}
+}
+
+function getFileRecordingSupportSnapshot(): boolean {
+  return getSaveFilePicker() !== null
+}
+
+function getServerFileRecordingSupportSnapshot(): boolean {
+  return false
+}
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message
@@ -172,12 +230,20 @@ function getErrorMessage(error: unknown): string {
   return "Unknown serial error."
 }
 
+function isPortAlreadyOpenError(error: unknown): boolean {
+  return getErrorMessage(error).toLowerCase().includes("already open")
+}
+
 function toHex(value?: number): string {
   if (value === undefined) {
     return "----"
   }
 
   return value.toString(16).toUpperCase().padStart(4, "0")
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
 function formatFloat(value: number, digits = 2): string {
@@ -203,6 +269,55 @@ function toLatestDecodedFrame(
     snr: frame.snr,
     receivedAt,
   }
+}
+
+function getRecordingSuggestedName(date: Date): string {
+  return `baja-telemetry-${date.toISOString().replace(/[:.]/g, "-")}.jsonl`
+}
+
+function createRecordingMetadataLine(startedAt: string, baudRate: string): string {
+  return `${JSON.stringify({
+    kind: "recording-start",
+    format: "baja-telemetry-jsonl-v1",
+    startedAt,
+    source: "Chrome Web Serial",
+    baudRate,
+  })}\n`
+}
+
+function createRecordingStopLine(
+  endedAt: string,
+  entries: number,
+  bytes: number,
+): string {
+  return `${JSON.stringify({
+    kind: "recording-stop",
+    endedAt,
+    serialChunks: entries,
+    serialBytes: bytes,
+  })}\n`
+}
+
+function createRecordingChunkLine(
+  receivedAt: string,
+  chunk: Uint8Array,
+  frames: ParsedTelemetryFrame[],
+  errors: string[],
+): string {
+  return `${JSON.stringify({
+    kind: "serial-chunk",
+    receivedAt,
+    byteLength: chunk.byteLength,
+    rawHex: bytesToHex(chunk),
+    frames: frames.map((frame) => ({
+      payloadLength: frame.payloadLength,
+      packet: frame.packet,
+      rssi: frame.rssi,
+      snr: frame.snr,
+      rawPayloadHex: bytesToHex(frame.rawPayload),
+    })),
+    errors,
+  })}\n`
 }
 
 function updateLatestFrames(
@@ -332,15 +447,26 @@ function SlowPacketFields({ packet }: { packet: SlowTelemetryPacket | null }) {
 export function SerialConsole() {
   const portRef = useRef<SerialPortLike | null>(null)
   const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
+  const readLoopPromiseRef = useRef<Promise<void> | null>(null)
+  const disconnectPromiseRef = useRef<Promise<void> | null>(null)
   const shouldReadRef = useRef(false)
   const frameBufferRef = useRef<Uint8Array>(new Uint8Array())
+  const recordingStreamRef = useRef<FileSystemWritableFileStreamLike | null>(null)
+  const recordingWriteChainRef = useRef<Promise<void>>(Promise.resolve())
+  const recordedEntriesRef = useRef(0)
+  const recordedBytesRef = useRef(0)
 
   const [baudRate, setBaudRate] = useState(DEFAULT_BAUD_RATE)
   const [authorizedPorts, setAuthorizedPorts] = useState<AuthorizedPort[]>([])
   const [connectionLabel, setConnectionLabel] = useState<string | null>(null)
   const [totalBytes, setTotalBytes] = useState(0)
   const [connecting, setConnecting] = useState(false)
+  const [closing, setClosing] = useState(false)
   const [connected, setConnected] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const [recordedEntries, setRecordedEntries] = useState(0)
+  const [recordedBytes, setRecordedBytes] = useState(0)
+  const [recordingStartedAt, setRecordingStartedAt] = useState<string | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [packetCounters, setPacketCounters] = useState<PacketCounters>(EMPTY_PACKET_COUNTERS)
   const [latestFrames, setLatestFrames] = useState<LatestDecodedFrames>(EMPTY_LATEST_FRAMES)
@@ -348,6 +474,11 @@ export function SerialConsole() {
     subscribeSerialSupport,
     getSerialSupportSnapshot,
     getServerSerialSupportSnapshot,
+  )
+  const fileRecordingSupported = useSyncExternalStore(
+    subscribeFileRecordingSupport,
+    getFileRecordingSupportSnapshot,
+    getServerFileRecordingSupportSnapshot,
   )
 
   const refreshAuthorizedPorts = useCallback(async () => {
@@ -363,44 +494,212 @@ export function SerialConsole() {
     })
   }, [])
 
-  const disconnectPort = useCallback(
-    async () => {
-      shouldReadRef.current = false
-      frameBufferRef.current = new Uint8Array()
+  const stopRecording = useCallback(async () => {
+    const stream = recordingStreamRef.current
 
-      const reader = readerRef.current
-      readerRef.current = null
+    if (!stream) {
+      return
+    }
 
-      if (reader) {
-        try {
-          await reader.cancel()
-        } catch {
-          // Ignore cancellation errors during teardown.
-        }
+    recordingStreamRef.current = null
+    setErrorMessage(null)
 
-        try {
-          reader.releaseLock()
-        } catch {
-          // Ignore release errors if the stream already detached.
-        }
-      }
+    try {
+      await recordingWriteChainRef.current
+      await stream.write(
+        createRecordingStopLine(
+          new Date().toISOString(),
+          recordedEntriesRef.current,
+          recordedBytesRef.current,
+        ),
+      )
+      await stream.close()
+    } catch (error) {
+      setErrorMessage(`Recording error: ${getErrorMessage(error)}`)
+    } finally {
+      recordingWriteChainRef.current = Promise.resolve()
+      startTransition(() => {
+        setRecording(false)
+        setRecordingStartedAt(null)
+      })
+    }
+  }, [])
 
-      const port = portRef.current
-      portRef.current = null
+  function queueRecordingLine(line: string, byteLength: number) {
+    const stream = recordingStreamRef.current
 
-      if (port) {
-        try {
-          await port.close()
-        } catch {
-          // Ignore close errors caused by device removal.
-        }
-      }
+    if (!stream) {
+      return
+    }
+
+    recordingWriteChainRef.current = recordingWriteChainRef.current
+      .then(async () => {
+        await stream.write(line)
+
+        recordedEntriesRef.current += 1
+        recordedBytesRef.current += byteLength
+
+        startTransition(() => {
+          setRecordedEntries(recordedEntriesRef.current)
+          setRecordedBytes(recordedBytesRef.current)
+        })
+      })
+      .catch((error) => {
+        recordingStreamRef.current = null
+        setErrorMessage(`Recording error: ${getErrorMessage(error)}`)
+        startTransition(() => {
+          setRecording(false)
+          setRecordingStartedAt(null)
+        })
+      })
+  }
+
+  async function startRecording() {
+    const showSaveFilePicker = getSaveFilePicker()
+
+    if (!showSaveFilePicker) {
+      setErrorMessage("File recording requires a Chromium browser with file access support.")
+      return
+    }
+
+    if (recordingStreamRef.current) {
+      return
+    }
+
+    const startedAt = new Date()
+    setErrorMessage(null)
+
+    try {
+      const handle = await showSaveFilePicker({
+        suggestedName: getRecordingSuggestedName(startedAt),
+        types: [
+          {
+            description: "JSON Lines telemetry log",
+            accept: {
+              "application/jsonl": [".jsonl"],
+              "application/x-ndjson": [".ndjson"],
+              "text/plain": [".txt"],
+            },
+          },
+        ],
+      })
+      const stream = await handle.createWritable({ mode: "exclusive" })
+
+      recordingStreamRef.current = stream
+      recordingWriteChainRef.current = stream.write(
+        createRecordingMetadataLine(startedAt.toISOString(), baudRate),
+      )
+      recordedEntriesRef.current = 0
+      recordedBytesRef.current = 0
 
       startTransition(() => {
-        setConnected(false)
-        setConnecting(false)
-        setConnectionLabel(null)
+        setRecordedEntries(0)
+        setRecordedBytes(0)
+        setRecordingStartedAt(startedAt.toLocaleTimeString())
+        setRecording(true)
       })
+    } catch (error) {
+      const message = getErrorMessage(error)
+
+      if (message.toLowerCase().includes("abort")) {
+        return
+      }
+
+      setErrorMessage(`Recording error: ${message}`)
+    }
+  }
+
+  const disconnectPort = useCallback(
+    async () => {
+      if (disconnectPromiseRef.current) {
+        await disconnectPromiseRef.current
+        return
+      }
+
+      const disconnectPromise = (async () => {
+        const port = portRef.current
+        const reader = readerRef.current
+        const readLoopPromise = readLoopPromiseRef.current
+
+        shouldReadRef.current = false
+        frameBufferRef.current = new Uint8Array()
+
+        startTransition(() => {
+          setClosing(Boolean(port || reader || readLoopPromise))
+          setConnecting(false)
+        })
+
+        if (reader && readLoopPromise) {
+          void reader.cancel().catch(() => {
+            // Ignore cancellation errors during teardown.
+          })
+        } else if (reader) {
+          try {
+            await reader.cancel()
+          } catch {
+            // Ignore cancellation errors during teardown.
+          }
+        }
+
+        if (readLoopPromise) {
+          await readLoopPromise.catch(() => {
+            // The read loop reports non-teardown errors through component state.
+          })
+        } else if (reader) {
+          try {
+            reader.releaseLock()
+          } catch {
+            // Ignore release errors if the stream already detached.
+          }
+
+          if (readerRef.current === reader) {
+            readerRef.current = null
+          }
+        }
+
+        if (port) {
+          try {
+            await port.close()
+          } catch (error) {
+            const message = getErrorMessage(error)
+
+            if (port.readable || port.writable) {
+              startTransition(() => {
+                setConnected(true)
+                setClosing(false)
+                setConnecting(false)
+              })
+              setErrorMessage(`Failed to close serial port: ${message}`)
+              return
+            }
+          }
+
+          if (portRef.current === port) {
+            portRef.current = null
+          }
+        }
+
+        if (readLoopPromiseRef.current === readLoopPromise) {
+          readLoopPromiseRef.current = null
+        }
+
+        startTransition(() => {
+          setConnected(false)
+          setClosing(false)
+          setConnecting(false)
+          setConnectionLabel(null)
+        })
+      })()
+
+      disconnectPromiseRef.current = disconnectPromise
+
+      try {
+        await disconnectPromise
+      } finally {
+        if (disconnectPromiseRef.current === disconnectPromise) {
+          disconnectPromiseRef.current = null
+        }
+      }
     },
     [],
   )
@@ -431,6 +730,12 @@ export function SerialConsole() {
     }
   }, [disconnectPort, refreshAuthorizedPorts])
 
+  useEffect(() => {
+    return () => {
+      void stopRecording()
+    }
+  }, [stopRecording])
+
   async function beginReading(port: SerialPortLike) {
     shouldReadRef.current = true
 
@@ -451,7 +756,18 @@ export function SerialConsole() {
           }
 
           const parseResult = parseTelemetryFrames(frameBufferRef.current, value)
-          const receivedAt = new Date().toLocaleTimeString()
+          const receivedAtDate = new Date()
+          const receivedAt = receivedAtDate.toLocaleTimeString()
+
+          queueRecordingLine(
+            createRecordingChunkLine(
+              receivedAtDate.toISOString(),
+              value,
+              parseResult.frames,
+              parseResult.errors,
+            ),
+            value.byteLength,
+          )
 
           frameBufferRef.current = parseResult.remaining
 
@@ -490,10 +806,11 @@ export function SerialConsole() {
       }
     }
 
-    if (portRef.current === port) {
+    if (shouldReadRef.current && portRef.current === port) {
       portRef.current = null
       startTransition(() => {
         setConnected(false)
+        setClosing(false)
         setConnecting(false)
         setConnectionLabel(null)
       })
@@ -508,8 +825,16 @@ export function SerialConsole() {
       return
     }
 
+    if (disconnectPromiseRef.current) {
+      await disconnectPromiseRef.current
+    }
+
     if (portRef.current) {
       await disconnectPort()
+
+      if (portRef.current) {
+        return
+      }
     }
 
     const label = describePort(port, 0).label
@@ -517,31 +842,51 @@ export function SerialConsole() {
     frameBufferRef.current = new Uint8Array()
     setErrorMessage(null)
     setConnecting(true)
+    setClosing(false)
 
     try {
-      await port.open({
+      const openOptions: SerialPortOpenOptionsLike = {
         baudRate: parsedBaudRate,
         dataBits: 8,
         stopBits: 1,
         parity: "none",
         bufferSize: 4096,
         flowControl: "none",
-      })
+      }
+
+      try {
+        await port.open(openOptions)
+      } catch (error) {
+        if (!isPortAlreadyOpenError(error) || (!port.readable && !port.writable)) {
+          throw error
+        }
+
+        await port.close()
+        await port.open(openOptions)
+      }
 
       portRef.current = port
 
       startTransition(() => {
         setConnected(true)
+        setClosing(false)
         setConnecting(false)
         setConnectionLabel(label)
       })
 
-      void beginReading(port)
+      const readLoopPromise = beginReading(port)
+      readLoopPromiseRef.current = readLoopPromise
+      void readLoopPromise.finally(() => {
+        if (readLoopPromiseRef.current === readLoopPromise) {
+          readLoopPromiseRef.current = null
+        }
+      })
       await refreshAuthorizedPorts()
     } catch (error) {
       const message = getErrorMessage(error)
 
       startTransition(() => {
+        setClosing(false)
         setConnecting(false)
         setConnected(false)
         setConnectionLabel(null)
@@ -582,17 +927,39 @@ export function SerialConsole() {
     await connectToPort(port)
   }
 
-  const connectionStatus = connected ? "Connected" : connecting ? "Connecting" : "Disconnected"
-  const connectionTone = connected
-    ? "border-emerald-300 bg-emerald-50 text-emerald-800"
-    : connecting
-      ? "border-amber-300 bg-amber-50 text-amber-800"
+  const serialBusy = connecting || closing
+  const connectionStatus = closing
+    ? "Closing"
+    : connected
+      ? "Connected"
+      : connecting
+        ? "Connecting"
+        : "Disconnected"
+  const connectionTone = serialBusy
+    ? "border-amber-300 bg-amber-50 text-amber-800"
+    : connected
+      ? "border-emerald-300 bg-emerald-50 text-emerald-800"
       : "border-zinc-300 bg-zinc-50 text-zinc-700"
-  const statusDotTone = connected
-    ? "bg-emerald-500"
-    : connecting
-      ? "bg-amber-500"
+  const statusDotTone = serialBusy
+    ? "bg-amber-500"
+    : connected
+      ? "bg-emerald-500"
       : "bg-zinc-400"
+  const recordingStatus = recording ? "Recording" : "Idle"
+  const recordingTone = recording
+    ? "border-red-300 bg-red-50 text-red-800"
+    : fileRecordingSupported
+      ? "border-zinc-300 bg-zinc-50 text-zinc-700"
+      : "border-amber-300 bg-amber-50 text-amber-800"
+  const recordingDotTone = recording
+    ? "bg-red-500"
+    : fileRecordingSupported
+      ? "bg-zinc-400"
+      : "bg-amber-500"
+  const latestFastPacket =
+    latestFrames.fast?.packet.type === "fast" ? latestFrames.fast.packet : null
+  const latestSlowPacket =
+    latestFrames.slow?.packet.type === "slow" ? latestFrames.slow.packet : null
 
   return (
     <main className="min-h-screen bg-background text-foreground">
@@ -670,7 +1037,7 @@ export function SerialConsole() {
                   <Button
                     className="col-span-2 h-9 rounded-md"
                     onClick={() => void handleGrantPort()}
-                    disabled={!serialSupported || connecting}
+                    disabled={!serialSupported || serialBusy}
                   >
                     <PlugZap />
                     Connect
@@ -679,7 +1046,7 @@ export function SerialConsole() {
                     variant="outline"
                     className="h-9 rounded-md"
                     onClick={() => void refreshAuthorizedPorts()}
-                    disabled={!serialSupported || connecting}
+                    disabled={!serialSupported || serialBusy}
                   >
                     <RefreshCw />
                     Refresh
@@ -688,7 +1055,7 @@ export function SerialConsole() {
                     variant="outline"
                     className="h-9 rounded-md"
                     onClick={() => void disconnectPort()}
-                    disabled={!connected && !connecting}
+                    disabled={closing || (!connected && !connecting)}
                   >
                     <Power />
                     Close
@@ -718,6 +1085,64 @@ export function SerialConsole() {
                   <AlertCircle className="size-4" />
                   <AlertTitle>Serial error</AlertTitle>
                   <AlertDescription>{errorMessage}</AlertDescription>
+                </Alert>
+              ) : null}
+            </section>
+
+            <section className="rounded-lg border border-border bg-card p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <FileText className="size-4 text-muted-foreground" />
+                  <h2 className="font-semibold">Data Recorder</h2>
+                </div>
+                <span
+                  className={`inline-flex items-center gap-2 rounded-md border px-2 py-1 text-xs font-medium ${recordingTone}`}
+                >
+                  <span className={`size-1.5 rounded-full ${recordingDotTone}`} />
+                  {recordingStatus}
+                </span>
+              </div>
+
+              <div className="mt-4 space-y-3">
+                <Button
+                  variant={recording ? "destructive" : "outline"}
+                  className="h-9 w-full rounded-md"
+                  onClick={() => {
+                    if (recording) {
+                      void stopRecording()
+                    } else {
+                      void startRecording()
+                    }
+                  }}
+                  disabled={!fileRecordingSupported && !recording}
+                >
+                  {recording ? <CircleStop /> : <Circle className="fill-current" />}
+                  {recording ? "Stop" : "Record"}
+                </Button>
+
+                <dl className="divide-y divide-border border-t border-border text-sm">
+                  <div className="flex items-center justify-between gap-3 py-3">
+                    <dt className="text-muted-foreground">Started</dt>
+                    <dd className="min-w-0 truncate text-right font-medium">
+                      {recordingStartedAt ?? "None"}
+                    </dd>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 py-3">
+                    <dt className="text-muted-foreground">Chunks</dt>
+                    <dd className="font-mono font-medium">{recordedEntries}</dd>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 py-3">
+                    <dt className="text-muted-foreground">Bytes</dt>
+                    <dd className="font-mono font-medium">{recordedBytes}</dd>
+                  </div>
+                </dl>
+              </div>
+
+              {!fileRecordingSupported ? (
+                <Alert variant="destructive" className="mt-4 rounded-lg">
+                  <AlertCircle className="size-4" />
+                  <AlertTitle>File recorder unavailable</AlertTitle>
+                  <AlertDescription>Use a Chromium browser on localhost or HTTPS.</AlertDescription>
                 </Alert>
               ) : null}
             </section>
@@ -756,7 +1181,7 @@ export function SerialConsole() {
                           size="sm"
                           className="rounded-md"
                           onClick={() => void handleReconnectSavedPort(entry.port)}
-                          disabled={connecting}
+                          disabled={serialBusy}
                         >
                           <Waves />
                           Open
@@ -770,6 +1195,34 @@ export function SerialConsole() {
           </aside>
 
           <div className="min-w-0 space-y-4">
+            <section>
+              <div className="grid gap-3 xl:grid-cols-[minmax(0,0.9fr)_minmax(380px,1.1fr)]">
+                <div className="flex min-w-0 flex-col gap-3">
+                  <VehicleSpeedGauge
+                    value={latestFastPacket?.speed_mph ?? null}
+                    updatedAt={latestFrames.fast?.receivedAt ?? null}
+                  />
+                  <VehicleFuelLevel
+                    value={latestSlowPacket?.fuel_percent ?? null}
+                    updatedAt={latestFrames.slow?.receivedAt ?? null}
+                    className="xl:flex-1"
+                  />
+                  <VehicleStatusCard
+                    statuses={latestSlowPacket?.board_statuses ?? null}
+                    updatedAt={latestFrames.slow?.receivedAt ?? null}
+                  />
+                </div>
+                <VehicleLocationMap
+                  latitude={latestFastPacket?.latitude_deg ?? null}
+                  longitude={latestFastPacket?.longitude_deg ?? null}
+                  rssi={latestFrames.fast?.rssi ?? null}
+                  snr={latestFrames.fast?.snr ?? null}
+                  updatedAt={latestFrames.fast?.receivedAt ?? null}
+                  className="xl:self-start"
+                />
+              </div>
+            </section>
+
             <section>
               <header className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
@@ -790,13 +1243,7 @@ export function SerialConsole() {
                     </Badge>
                   </header>
                   <div className="mt-4">
-                    <FastPacketFields
-                      packet={
-                        latestFrames.fast?.packet.type === "fast"
-                          ? latestFrames.fast.packet
-                          : null
-                      }
-                    />
+                    <FastPacketFields packet={latestFastPacket} />
                   </div>
                 </article>
 
@@ -832,13 +1279,7 @@ export function SerialConsole() {
                     </Badge>
                   </header>
                   <div className="mt-4">
-                    <SlowPacketFields
-                      packet={
-                        latestFrames.slow?.packet.type === "slow"
-                          ? latestFrames.slow.packet
-                          : null
-                      }
-                    />
+                    <SlowPacketFields packet={latestSlowPacket} />
                   </div>
                 </article>
               </div>
