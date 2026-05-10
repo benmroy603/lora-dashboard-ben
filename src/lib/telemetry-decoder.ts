@@ -6,6 +6,7 @@ export const SR_FAST_PKT_LEN = 14
 export const SR_MED_PKT_LEN = 25
 export const SR_SLOW_PKT_LEN = 24
 export const SERIAL_SIGNAL_BYTES = 8
+const GPS_FIXED_POINT_SCALE = 10_000_000
 
 export const boardStatusFlags = [
   "wheel",
@@ -81,6 +82,19 @@ function getDataView(bytes: Uint8Array): DataView {
 
 function readFloat32Le(view: DataView, offset: number): number {
   return view.getFloat32(offset, true)
+}
+
+function normalizeFixedPointCoordinate(
+  value: number,
+  maxAbsoluteDegrees: number,
+): number {
+  if (!Number.isFinite(value) || Math.abs(value) <= maxAbsoluteDegrees) {
+    return value
+  }
+
+  const scaledValue = value / GPS_FIXED_POINT_SCALE
+
+  return Math.abs(scaledValue) <= maxAbsoluteDegrees ? scaledValue : value
 }
 
 function isKnownPayloadLength(length: number): boolean {
@@ -191,8 +205,8 @@ export function decodeTelemetryPayload(payload: Uint8Array): TelemetryPacket {
         primary_rpm: view.getUint16(1, false),
         output_rpm: view.getUint16(3, false),
         speed_mph: view.getUint8(5),
-        latitude_deg: readFloat32Le(view, 6),
-        longitude_deg: readFloat32Le(view, 10),
+        latitude_deg: normalizeFixedPointCoordinate(readFloat32Le(view, 6), 90),
+        longitude_deg: normalizeFixedPointCoordinate(readFloat32Le(view, 10), 180),
       }
 
     case SR_PKT_TYPE_MEDIUM:

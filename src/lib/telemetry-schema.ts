@@ -24,8 +24,16 @@ export const telemetryPacketSections: TelemetryPacketSection[] = [
       { name: "primary_rpm", type: "uint16" },
       { name: "output_rpm", type: "uint16" },
       { name: "speed_mph", type: "uint8" },
-      { name: "latitude_deg", type: "float32" },
-      { name: "longitude_deg", type: "float32" },
+      {
+        name: "latitude_deg",
+        type: "float32",
+        note: "accepts decimal degrees or E7 fixed-point degrees",
+      },
+      {
+        name: "longitude_deg",
+        type: "float32",
+        note: "accepts decimal degrees or E7 fixed-point degrees",
+      },
     ],
   },
   {
