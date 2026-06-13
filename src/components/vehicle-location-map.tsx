@@ -40,9 +40,8 @@ type VehicleLocationMapProps = {
 const DEFAULT_CENTER: VehiclePosition = [39.8283, -98.5795]
 const DEFAULT_ZOOM = 4
 const VEHICLE_ZOOM = 16
-const OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-const OSM_ATTRIBUTION =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+const SATELLITE_TILE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+const SATELLITE_ATTRIBUTION = '&copy; <a href="https://www.esri.com/">Esri</a>'
 
 const EARTH_RADIUS_METERS = 6_371_000
 const MIN_SAMPLE_DISTANCE_METERS = 2.5
@@ -268,8 +267,8 @@ export function VehicleLocationMap({
       )
       leaflet.control.zoom({ position: "bottomright" }).addTo(map)
       leaflet
-        .tileLayer(OSM_TILE_URL, {
-          attribution: OSM_ATTRIBUTION,
+        .tileLayer(SATELLITE_TILE_URL, {
+          attribution: SATELLITE_ATTRIBUTION,
           crossOrigin: true,
           maxZoom: 19,
           minZoom: 2,
